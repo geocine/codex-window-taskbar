@@ -1,0 +1,23 @@
+use super::Strings;
+
+pub(super) const STRINGS: Strings = Strings {
+    window_title: "Codex Windows Taskbar",
+    refresh: "Refresh",
+    update_frequency: "Update Frequency",
+    one_minute: "1 Minute",
+    five_minutes: "5 Minutes",
+    fifteen_minutes: "15 Minutes",
+    one_hour: "1 Hour",
+    settings: "Settings",
+    start_with_windows: "Start with Windows",
+    reset_position: "Reset Position",
+    exit: "Exit",
+    show_widget: "Show Widget",
+    session_window: "5h",
+    weekly_window: "7d",
+    now: "now",
+    day_suffix: "d",
+    hour_suffix: "h",
+    minute_suffix: "m",
+    second_suffix: "s",
+};
