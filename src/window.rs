@@ -101,6 +101,7 @@ const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const TOOLTIP_HEIGHT: i32 = 36;
 const TOOLTIP_MIN_WIDTH: i32 = 150;
 const TOOLTIP_RADIUS: i32 = 2;
+const TOOLTIP_TEXT_PADDING_X: i32 = 8;
 const WINDOWS_TICK: u64 = 10_000_000;
 const SEC_TO_UNIX_EPOCH: u64 = 11_644_473_600;
 
@@ -538,10 +539,17 @@ fn provider_bar_width() -> i32 {
     (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * PROVIDER_SEGMENT_COUNT - sc(SEGMENT_GAP)
 }
 
+fn usage_label_x() -> i32 {
+    sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN)
+}
+
+fn usage_bar_x() -> i32 {
+    usage_label_x() + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN)
+}
+
 fn bar_rect(row: UsageRow) -> RECT {
     let height = sc(WIDGET_HEIGHT);
-    let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-    let bar_x = content_x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+    let bar_x = usage_bar_x();
     let row2_y = height - sc(7) - sc(SEGMENT_H);
     let row1_y = row2_y - sc(6) - sc(SEGMENT_H);
     let top = match row {
@@ -565,8 +573,8 @@ enum UsageRow {
 
 fn reset_tooltip_text(label: &str, resets_at: Option<SystemTime>) -> String {
     match resets_at.and_then(format_human_local_reset_time) {
-        Some(reset) => format!("{label}: {reset}"),
-        None => format!("{label}: reset time unavailable"),
+        Some(reset) => format!("{label} resets {reset}"),
+        None => format!("{label} reset time unavailable"),
     }
 }
 
@@ -615,15 +623,9 @@ fn format_human_local_reset_time(time: SystemTime) -> Option<String> {
         12 => "Dec",
         _ => "",
     };
-    let hour12 = match local.wHour % 12 {
-        0 => 12,
-        hour => hour,
-    };
-    let meridiem = if local.wHour < 12 { "AM" } else { "PM" };
-
     Some(format!(
-        "{weekday}, {month} {} {hour12}:{:02}:{:02} {meridiem}",
-        local.wDay, local.wMinute, local.wSecond
+        "{weekday} {month} {} {:02}:{:02}:{:02}",
+        local.wDay, local.wHour, local.wMinute, local.wSecond
     ))
 }
 
@@ -693,8 +695,7 @@ fn show_usage_tooltip(hwnd: HWND) {
         let widget_rect = native_interop::get_window_rect_safe(hwnd).unwrap_or_default();
         let text = native_interop::wide_str(&tooltip_text);
         let _ = SetWindowTextW(tooltip, PCWSTR::from_raw(text.as_ptr()));
-        let bar_left = bar_rect(UsageRow::Session).left;
-        let x = widget_rect.left + bar_left;
+        let x = widget_rect.left + usage_label_x() - sc(TOOLTIP_TEXT_PADDING_X);
         let width = (widget_rect.right - x).max(sc(TOOLTIP_MIN_WIDTH));
         let height = sc(TOOLTIP_HEIGHT);
         let mut y = widget_rect.top - height - sc(6);
@@ -876,9 +877,9 @@ fn paint_usage_tooltip(hdc: HDC, hwnd: HWND) {
         let old_font = SelectObject(hdc, font);
 
         let mut text_rect = RECT {
-            left: sc(8),
+            left: sc(TOOLTIP_TEXT_PADDING_X),
             top: sc(3),
-            right: rect.right - sc(8),
+            right: rect.right - sc(TOOLTIP_TEXT_PADDING_X),
             bottom: rect.bottom - sc(2),
         };
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
@@ -1345,7 +1346,7 @@ fn paint_content(
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let content_x = usage_label_x();
         let row2_y = height - sc(7) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(6) - sc(SEGMENT_H);
 
