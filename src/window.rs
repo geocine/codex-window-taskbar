@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
@@ -10,9 +10,12 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_R};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_R,
+};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -46,6 +49,10 @@ struct AppState {
     hwnd: SendHwnd,
     taskbar_hwnd: Option<HWND>,
     tray_notify_hwnd: Option<HWND>,
+    tooltip_hwnd: Option<HWND>,
+    tooltip_visible: bool,
+    mouse_tracking: bool,
+    tooltip_text: String,
     win_event_hook: Option<HWINEVENTHOOK>,
     is_dark: bool,
     embedded: bool,
@@ -90,6 +97,12 @@ const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_REFRESH_SHORTCUT: u32 = native_interop::WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 const REFRESH_KEY_DEBOUNCE_MS: u64 = 500;
+const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
+const TOOLTIP_HEIGHT: i32 = 36;
+const TOOLTIP_MIN_WIDTH: i32 = 150;
+const TOOLTIP_RADIUS: i32 = 2;
+const WINDOWS_TICK: u64 = 10_000_000;
+const SEC_TO_UNIX_EPOCH: u64 = 11_644_473_600;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_REFRESH_KEY_AT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -504,10 +517,11 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 3;
-const TEXT_WIDTH: i32 = 54;
+const TEXT_WIDTH: i32 = 64;
 const RIGHT_MARGIN: i32 = 0;
 const TRAY_EDGE_OVERLAP: i32 = 8;
 const WIDGET_HEIGHT: i32 = 46;
+const UI_MONO_FONT: &str = "Consolas";
 
 fn total_widget_width() -> i32 {
     sc(LEFT_DIVIDER_W)
@@ -522,6 +536,357 @@ fn total_widget_width() -> i32 {
 
 fn provider_bar_width() -> i32 {
     (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * PROVIDER_SEGMENT_COUNT - sc(SEGMENT_GAP)
+}
+
+fn bar_rect(row: UsageRow) -> RECT {
+    let height = sc(WIDGET_HEIGHT);
+    let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+    let bar_x = content_x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+    let row2_y = height - sc(7) - sc(SEGMENT_H);
+    let row1_y = row2_y - sc(6) - sc(SEGMENT_H);
+    let top = match row {
+        UsageRow::Session => row1_y,
+        UsageRow::Weekly => row2_y,
+    };
+
+    RECT {
+        left: bar_x,
+        top,
+        right: bar_x + provider_bar_width(),
+        bottom: top + sc(SEGMENT_H),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UsageRow {
+    Session,
+    Weekly,
+}
+
+fn reset_tooltip_text(label: &str, resets_at: Option<SystemTime>) -> String {
+    match resets_at.and_then(format_human_local_reset_time) {
+        Some(reset) => format!("{label}: {reset}"),
+        None => format!("{label}: reset time unavailable"),
+    }
+}
+
+fn format_human_local_reset_time(time: SystemTime) -> Option<String> {
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    let ticks = duration
+        .as_secs()
+        .checked_add(SEC_TO_UNIX_EPOCH)?
+        .checked_mul(WINDOWS_TICK)?
+        .checked_add((duration.subsec_nanos() / 100) as u64)?;
+
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+
+    unsafe {
+        FileTimeToSystemTime(&file_time, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+
+    let weekday = match local.wDayOfWeek {
+        0 => "Sun",
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        _ => "",
+    };
+    let month = match local.wMonth {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "",
+    };
+    let hour12 = match local.wHour % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    let meridiem = if local.wHour < 12 { "AM" } else { "PM" };
+
+    Some(format!(
+        "{weekday}, {month} {} {hour12}:{:02}:{:02} {meridiem}",
+        local.wDay, local.wMinute, local.wSecond
+    ))
+}
+
+fn usage_tooltip_text(state: &AppState) -> String {
+    let strings = localization::strings();
+    let (session_reset, weekly_reset) = if state.last_poll_ok {
+        state
+            .codex_data
+            .as_ref()
+            .map(|data| (data.session.resets_at, data.weekly.resets_at))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
+    format!(
+        "{}\n{}",
+        reset_tooltip_text(strings.session_window, session_reset),
+        reset_tooltip_text(strings.weekly_window, weekly_reset)
+    )
+}
+
+fn point_is_over_usage_bar(x: i32, y: i32) -> bool {
+    let mut session = bar_rect(UsageRow::Session);
+    let mut weekly = bar_rect(UsageRow::Weekly);
+    for rect in [&mut session, &mut weekly] {
+        rect.left -= sc(3);
+        rect.top -= sc(4);
+        rect.right += sc(3);
+        rect.bottom += sc(4);
+    }
+    let pt = POINT { x, y };
+    point_in_rect(pt, session) || point_in_rect(pt, weekly)
+}
+
+fn track_mouse_leave(hwnd: HWND) {
+    unsafe {
+        let mut event = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        let _ = TrackMouseEvent(&mut event);
+    }
+}
+
+fn show_usage_tooltip(hwnd: HWND) {
+    let (tooltip, tooltip_text) = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        let Some(tooltip) = s.tooltip_hwnd else {
+            return;
+        };
+        if !s.mouse_tracking {
+            s.mouse_tracking = true;
+            track_mouse_leave(hwnd);
+        }
+        s.tooltip_visible = true;
+        s.tooltip_text = usage_tooltip_text(s);
+        (tooltip, s.tooltip_text.clone())
+    };
+
+    unsafe {
+        let widget_rect = native_interop::get_window_rect_safe(hwnd).unwrap_or_default();
+        let text = native_interop::wide_str(&tooltip_text);
+        let _ = SetWindowTextW(tooltip, PCWSTR::from_raw(text.as_ptr()));
+        let bar_left = bar_rect(UsageRow::Session).left;
+        let x = widget_rect.left + bar_left;
+        let width = (widget_rect.right - x).max(sc(TOOLTIP_MIN_WIDTH));
+        let height = sc(TOOLTIP_HEIGHT);
+        let mut y = widget_rect.top - height - sc(6);
+        if y < 0 {
+            y = widget_rect.bottom + sc(6);
+        }
+        let _ = SetWindowPos(
+            tooltip,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let rgn = CreateRoundRectRgn(
+            0,
+            0,
+            width + 1,
+            height + 1,
+            sc(TOOLTIP_RADIUS) * 2,
+            sc(TOOLTIP_RADIUS) * 2,
+        );
+        let _ = SetWindowRgn(tooltip, rgn, true);
+        let _ = InvalidateRect(tooltip, None, false);
+    }
+}
+
+fn hide_usage_tooltip() {
+    let tooltip = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        let Some(tooltip) = s.tooltip_hwnd else {
+            return;
+        };
+        if !s.tooltip_visible && !s.mouse_tracking {
+            return;
+        }
+        s.tooltip_visible = false;
+        s.mouse_tracking = false;
+        tooltip
+    };
+
+    unsafe {
+        let _ = ShowWindow(tooltip, SW_HIDE);
+    }
+}
+
+fn install_usage_tooltip(hwnd: HWND, hinstance: HINSTANCE) {
+    unsafe {
+        let tooltip = match CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            PCWSTR::from_raw(native_interop::wide_str("CodexWindowsTaskbarTooltip").as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            sc(TOOLTIP_MIN_WIDTH),
+            sc(TOOLTIP_HEIGHT),
+            hwnd,
+            HMENU::default(),
+            hinstance,
+            None,
+        ) {
+            Ok(tooltip) if !tooltip.0.is_null() => tooltip,
+            _ => {
+                diagnose::log("usage tooltip creation failed");
+                return;
+            }
+        };
+
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.tooltip_hwnd = Some(tooltip);
+            s.tooltip_text = usage_tooltip_text(s);
+        }
+    }
+}
+
+fn update_usage_tooltip() {
+    let tooltip = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
+        let Some(tooltip) = s.tooltip_hwnd else {
+            return;
+        };
+        s.tooltip_text = usage_tooltip_text(s);
+        tooltip
+    };
+
+    unsafe {
+        let _ = InvalidateRect(tooltip, None, false);
+    }
+}
+
+unsafe extern "system" fn tooltip_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            paint_usage_tooltip(hdc, hwnd);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn paint_usage_tooltip(hdc: HDC, hwnd: HWND) {
+    let (is_dark, text) = {
+        let state = lock_state();
+        match state.as_ref() {
+            Some(s) => (s.is_dark, s.tooltip_text.clone()),
+            None => (theme::is_dark_mode(), String::new()),
+        }
+    };
+
+    unsafe {
+        let mut rect = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rect);
+
+        let bg = if is_dark {
+            Color::from_hex("#2D2D2D")
+        } else {
+            Color::from_hex("#FAFAFA")
+        };
+        let text_color = if is_dark {
+            Color::from_hex("#F2F2F2")
+        } else {
+            Color::from_hex("#202020")
+        };
+
+        let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
+        let old_brush = SelectObject(hdc, bg_brush);
+        let old_pen = SelectObject(hdc, CreatePen(PS_SOLID, sc(1), COLORREF(bg.to_colorref())));
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            sc(TOOLTIP_RADIUS) * 2,
+            sc(TOOLTIP_RADIUS) * 2,
+        );
+        let pen = SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        let _ = DeleteObject(pen);
+        let _ = DeleteObject(bg_brush);
+
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let font_name = native_interop::wide_str(UI_MONO_FONT);
+        let font = CreateFontW(
+            sc(-11),
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font);
+
+        let mut text_rect = RECT {
+            left: sc(8),
+            top: sc(3),
+            right: rect.right - sc(8),
+            bottom: rect.bottom - sc(2),
+        };
+        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+        let _ = DrawTextW(hdc, &mut text_wide, &mut text_rect, DT_LEFT | DT_NOPREFIX);
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+    }
 }
 
 pub fn run() {
@@ -578,6 +943,23 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
+        let tooltip_class_name = native_interop::wide_str("CodexWindowsTaskbarTooltip");
+        let tooltip_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(tooltip_wnd_proc),
+            hInstance: HINSTANCE(hinstance.0),
+            hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszClassName: PCWSTR::from_raw(tooltip_class_name.as_ptr()),
+            ..Default::default()
+        };
+
+        let tooltip_atom = RegisterClassExW(&tooltip_wc);
+        if tooltip_atom == 0 {
+            diagnose::log("tooltip RegisterClassExW returned 0");
+        }
+
         let settings = load_settings();
 
         // Create as layered popup (will be reparented into taskbar)
@@ -626,6 +1008,10 @@ pub fn run() {
                 hwnd: SendHwnd::from_hwnd(hwnd),
                 taskbar_hwnd: None,
                 tray_notify_hwnd: None,
+                tooltip_hwnd: None,
+                tooltip_visible: false,
+                mouse_tracking: false,
+                tooltip_text: String::new(),
                 win_event_hook: None,
                 is_dark,
                 embedded: false,
@@ -644,6 +1030,8 @@ pub fn run() {
                 widget_visible: settings.widget_visible,
             });
         }
+
+        install_usage_tooltip(hwnd, HINSTANCE(hinstance.0));
 
         // Try to embed in taskbar
         if let Some(taskbar_hwnd) = native_interop::find_taskbar() {
@@ -964,7 +1352,7 @@ fn paint_content(
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-        let font_name = native_interop::wide_str("Segoe UI");
+        let font_name = native_interop::wide_str(UI_MONO_FONT);
         let font = CreateFontW(
             sc(-12),
             0,
@@ -1345,6 +1733,7 @@ unsafe extern "system" fn wnd_proc(
                 check_theme_change();
             }
             refresh_dpi();
+            update_usage_tooltip();
             position_at_taskbar();
             render_layered();
             LRESULT(0)
@@ -1381,6 +1770,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
+            update_usage_tooltip();
             render_layered();
             schedule_countdown_timer();
             let (pct, tooltip) = tray_icon_data_from_state();
@@ -1435,10 +1825,21 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
             };
+            if !is_dragging {
+                if point_is_over_usage_bar(client_x, client_y) {
+                    show_usage_tooltip(hwnd);
+                } else {
+                    hide_usage_tooltip();
+                }
+            } else {
+                hide_usage_tooltip();
+            }
             if is_dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -1530,6 +1931,10 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
             }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE_MSG => {
+            hide_usage_tooltip();
             LRESULT(0)
         }
         WM_LBUTTONUP => {

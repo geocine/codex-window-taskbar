@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::native_interop::{self, Color, WM_APP_TRAY};
 
 const TRAY_ICON_ID: u32 = 1;
+const UI_MONO_FONT: &str = "Consolas";
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 50;
@@ -108,7 +109,7 @@ pub fn create_icon(percent: Option<f64>) -> HICON {
         let _ = DeleteObject(br_fill);
 
         // Draw centered percentage text
-        let font_name = native_interop::wide_str("Arial Bold");
+        let font_name = native_interop::wide_str(UI_MONO_FONT);
         let font = CreateFontW(
             font_h,
             0,
