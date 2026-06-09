@@ -102,6 +102,7 @@ const TOOLTIP_HEIGHT: i32 = 36;
 const TOOLTIP_MIN_WIDTH: i32 = 150;
 const TOOLTIP_RADIUS: i32 = 2;
 const TOOLTIP_TEXT_PADDING_X: i32 = 8;
+const TOOLTIP_MEASURE_MAX_WIDTH: i32 = 1000;
 const WINDOWS_TICK: u64 = 10_000_000;
 const SEC_TO_UNIX_EPOCH: u64 = 11_644_473_600;
 
@@ -624,7 +625,7 @@ fn format_human_local_reset_time(time: SystemTime) -> Option<String> {
         _ => "",
     };
     Some(format!(
-        "{weekday} {month} {} {:02}:{:02}:{:02}",
+        "{weekday} {month} {:02} {:02}:{:02}:{:02}",
         local.wDay, local.wHour, local.wMinute, local.wSecond
     ))
 }
@@ -696,7 +697,7 @@ fn show_usage_tooltip(hwnd: HWND) {
         let text = native_interop::wide_str(&tooltip_text);
         let _ = SetWindowTextW(tooltip, PCWSTR::from_raw(text.as_ptr()));
         let x = widget_rect.left + usage_label_x() - sc(TOOLTIP_TEXT_PADDING_X);
-        let width = (widget_rect.right - x).max(sc(TOOLTIP_MIN_WIDTH));
+        let width = tooltip_width_for_text(tooltip, &tooltip_text);
         let height = sc(TOOLTIP_HEIGHT);
         let mut y = widget_rect.top - height - sc(6);
         if y < 0 {
@@ -722,6 +723,35 @@ fn show_usage_tooltip(hwnd: HWND) {
         let _ = SetWindowRgn(tooltip, rgn, true);
         let _ = InvalidateRect(tooltip, None, false);
     }
+}
+
+unsafe fn tooltip_width_for_text(hwnd: HWND, text: &str) -> i32 {
+    let hdc = GetDC(hwnd);
+    if hdc.is_invalid() {
+        return sc(TOOLTIP_MIN_WIDTH);
+    }
+
+    let font = create_tooltip_font();
+    let old_font = SelectObject(hdc, font);
+    let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+    let mut text_rect = RECT {
+        left: 0,
+        top: 0,
+        right: sc(TOOLTIP_MEASURE_MAX_WIDTH),
+        bottom: sc(TOOLTIP_HEIGHT),
+    };
+    let _ = DrawTextW(
+        hdc,
+        &mut text_wide,
+        &mut text_rect,
+        DT_LEFT | DT_NOPREFIX | DT_CALCRECT,
+    );
+
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+    let _ = ReleaseDC(hwnd, hdc);
+
+    (text_rect.right - text_rect.left + sc(TOOLTIP_TEXT_PADDING_X * 2)).max(sc(TOOLTIP_MIN_WIDTH))
 }
 
 fn hide_usage_tooltip() {
@@ -857,23 +887,7 @@ fn paint_usage_tooltip(hdc: HDC, hwnd: HWND) {
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let font_name = native_interop::wide_str(UI_MONO_FONT);
-        let font = CreateFontW(
-            sc(-11),
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
+        let font = create_tooltip_font();
         let old_font = SelectObject(hdc, font);
 
         let mut text_rect = RECT {
@@ -888,6 +902,26 @@ fn paint_usage_tooltip(hdc: HDC, hwnd: HWND) {
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
     }
+}
+
+unsafe fn create_tooltip_font() -> HFONT {
+    let font_name = native_interop::wide_str(UI_MONO_FONT);
+    CreateFontW(
+        sc(-11),
+        0,
+        0,
+        0,
+        FW_NORMAL.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_TT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        PCWSTR::from_raw(font_name.as_ptr()),
+    )
 }
 
 pub fn run() {
