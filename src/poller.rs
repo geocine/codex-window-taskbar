@@ -527,37 +527,62 @@ pub fn time_until_display_change(resets_at: Option<SystemTime>) -> Option<Durati
 }
 
 fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
-    let total_mins = total_secs / 60;
-    let total_hours = total_secs / 3600;
-    let total_days = total_secs / 86400;
+    let (days, hours, mins, secs) = countdown_parts(total_secs);
 
-    if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
-    } else if total_hours >= 1 {
-        format!("{total_hours}{}", strings.hour_suffix)
-    } else if total_mins >= 1 {
-        format!("{total_mins}{}", strings.minute_suffix)
+    if days > 0 {
+        format_countdown_pair(days, strings.day_suffix, hours, strings.hour_suffix)
+    } else if hours > 0 {
+        format_countdown_pair(hours, strings.hour_suffix, mins, strings.minute_suffix)
+    } else if mins > 0 {
+        format_countdown_pair(mins, strings.minute_suffix, secs, strings.second_suffix)
     } else {
-        format!("{total_secs}{}", strings.second_suffix)
+        format!("{secs}{}", strings.second_suffix)
     }
 }
 
 fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
-    let total_mins = total_secs / 60;
-    let total_hours = total_secs / 3600;
-    let total_days = total_secs / 86400;
-
-    let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
-    } else if total_hours >= 1 {
-        total_hours * 3600
-    } else if total_mins >= 1 {
-        total_mins * 60
-    } else {
-        total_secs
-    };
+    let current_bucket_start = countdown_display_bucket_start(total_secs);
 
     Duration::from_secs(total_secs.saturating_sub(current_bucket_start) + 1)
+}
+
+fn countdown_parts(total_secs: u64) -> (u64, u64, u64, u64) {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    let days = total_secs / DAY;
+    let hours = (total_secs % DAY) / HOUR;
+    let mins = (total_secs % HOUR) / MINUTE;
+    let secs = total_secs % MINUTE;
+
+    (days, hours, mins, secs)
+}
+
+fn format_countdown_pair(major: u64, major_suffix: &str, minor: u64, minor_suffix: &str) -> String {
+    if minor > 0 {
+        format!("{major}{major_suffix} {minor}{minor_suffix}")
+    } else {
+        format!("{major}{major_suffix}")
+    }
+}
+
+fn countdown_display_bucket_start(total_secs: u64) -> u64 {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    let (days, hours, mins, secs) = countdown_parts(total_secs);
+
+    if days > 0 {
+        days * DAY + hours * HOUR
+    } else if hours > 0 {
+        hours * HOUR + mins * MINUTE
+    } else if mins > 0 {
+        mins * MINUTE + secs
+    } else {
+        total_secs
+    }
 }
 
 /// Returns true if either section has reached "now" (reset time has passed).
@@ -565,4 +590,49 @@ pub fn is_past_reset(data: &UsageData) -> bool {
     let now = SystemTime::now();
     let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
     past(&data.session) || past(&data.weekly)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::localization;
+
+    #[test]
+    fn formats_countdown_with_two_significant_units() {
+        let strings = localization::strings();
+
+        assert_eq!(format_countdown_from_secs(101_040, strings), "1d 4h");
+        assert_eq!(format_countdown_from_secs(3_720, strings), "1h 2m");
+        assert_eq!(format_countdown_from_secs(123, strings), "2m 3s");
+        assert_eq!(format_countdown_from_secs(42, strings), "42s");
+    }
+
+    #[test]
+    fn omits_zero_minor_units() {
+        let strings = localization::strings();
+
+        assert_eq!(format_countdown_from_secs(172_800, strings), "2d");
+        assert_eq!(format_countdown_from_secs(7_200, strings), "2h");
+        assert_eq!(format_countdown_from_secs(120, strings), "2m");
+    }
+
+    #[test]
+    fn schedules_updates_for_visible_countdown_unit() {
+        assert_eq!(
+            time_until_display_change_from_secs(101_040),
+            Duration::from_secs(241)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(3_725),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(123),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(3_600),
+            Duration::from_secs(1)
+        );
+    }
 }

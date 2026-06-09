@@ -518,7 +518,7 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 3;
-const TEXT_WIDTH: i32 = 64;
+const TEXT_WIDTH: i32 = 86;
 const RIGHT_MARGIN: i32 = 0;
 const TRAY_EDGE_OVERLAP: i32 = 8;
 const WIDGET_HEIGHT: i32 = 46;
@@ -2379,7 +2379,7 @@ fn compact_provider_text(text: &str, include_countdown: bool) -> Option<String> 
     if include_countdown {
         if let Some(countdown) = compact_countdown(text) {
             compact.push(' ');
-            compact.push_str(countdown);
+            compact.push_str(&countdown);
         }
     }
     Some(compact)
@@ -2395,10 +2395,18 @@ fn compact_percent(text: &str) -> Option<String> {
     Some(format!("{number:>3}%"))
 }
 
-fn compact_countdown(text: &str) -> Option<&str> {
-    text.split_whitespace()
-        .nth(2)
-        .filter(|value| !value.is_empty())
+fn compact_countdown(text: &str) -> Option<String> {
+    let countdown = text
+        .split_whitespace()
+        .skip(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if countdown.is_empty() {
+        None
+    } else {
+        Some(countdown)
+    }
 }
 
 fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
