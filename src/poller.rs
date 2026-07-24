@@ -49,6 +49,10 @@ struct CodexRateLimit {
 struct CodexUsageBucket {
     used_percent: f64,
     reset_at: Option<i64>,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
+    #[serde(default)]
+    reset_after_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -156,20 +160,40 @@ fn try_codex_usage_endpoint(
 }
 
 fn codex_usage_response_to_data(response: CodexUsageResponse) -> Result<UsageData, PollError> {
-    let mut data = UsageData::default();
     let rate_limit = response.rate_limit.ok_or(PollError::RequestFailed)?;
+    let mut windows = Vec::new();
 
     if let Some(bucket) = rate_limit.primary_window {
-        data.session.percentage = bucket.used_percent;
-        data.session.resets_at = unix_to_system_time(bucket.reset_at);
+        windows.push(bucket_to_section(bucket));
     }
-
     if let Some(bucket) = rate_limit.secondary_window {
-        data.weekly.percentage = bucket.used_percent;
-        data.weekly.resets_at = unix_to_system_time(bucket.reset_at);
+        windows.push(bucket_to_section(bucket));
     }
 
-    Ok(data)
+    if windows.is_empty() {
+        diagnose::log("codex usage response contained no rate-limit windows");
+        return Err(PollError::RequestFailed);
+    }
+
+    Ok(UsageData { windows })
+}
+
+fn bucket_to_section(bucket: CodexUsageBucket) -> UsageSection {
+    let resets_at = unix_to_system_time(bucket.reset_at).or_else(|| {
+        bucket
+            .reset_after_seconds
+            .filter(|&secs| secs >= 0)
+            .map(|secs| SystemTime::now() + Duration::from_secs(secs as u64))
+    });
+
+    UsageSection {
+        percentage: bucket.used_percent,
+        resets_at,
+        limit_window_seconds: bucket
+            .limit_window_seconds
+            .filter(|&secs| secs > 0)
+            .map(|secs| secs as u64),
+    }
 }
 
 fn fetch_wsl_codex_usage() -> Result<UsageData, PollError> {
@@ -494,6 +518,28 @@ pub fn remaining_percent(used_percent: f64) -> f64 {
     (100.0 - used_percent.clamp(0.0, 100.0)).clamp(0.0, 100.0)
 }
 
+/// Human-readable window label derived from `limit_window_seconds` (e.g. "5h", "7d").
+pub fn window_label(section: &UsageSection, strings: Strings) -> String {
+    match section.limit_window_seconds {
+        Some(secs) => {
+            const HOUR: u64 = 3600;
+            const DAY: u64 = 24 * HOUR;
+            if secs >= DAY {
+                let days = ((secs as f64) / DAY as f64).round().max(1.0) as u64;
+                format!("{days}{}", strings.day_suffix)
+            } else if secs >= HOUR {
+                let hours = ((secs as f64) / HOUR as f64).round().max(1.0) as u64;
+                format!("{hours}{}", strings.hour_suffix)
+            } else {
+                let mins = ((secs as f64) / 60.0).round().max(1.0) as u64;
+                format!("{mins}{}", strings.minute_suffix)
+            }
+        }
+        // Prefer weekly-style fallback only when we truly have no length metadata.
+        None => strings.weekly_window.to_string(),
+    }
+}
+
 /// Format a usage window as "X% · Yh" style text, where X is remaining quota.
 pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     let pct = format!("{:.0}%", remaining_percent(section.percentage));
@@ -585,11 +631,12 @@ fn countdown_display_bucket_start(total_secs: u64) -> u64 {
     }
 }
 
-/// Returns true if either section has reached "now" (reset time has passed).
+/// Returns true if any window has reached "now" (reset time has passed).
 pub fn is_past_reset(data: &UsageData) -> bool {
     let now = SystemTime::now();
-    let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
-    past(&data.session) || past(&data.weekly)
+    data.windows
+        .iter()
+        .any(|s| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok()))
 }
 
 #[cfg(test)]
@@ -634,5 +681,63 @@ mod tests {
             time_until_display_change_from_secs(3_600),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn labels_windows_from_limit_seconds() {
+        let strings = localization::strings();
+        let five_h = UsageSection {
+            limit_window_seconds: Some(18_000),
+            ..Default::default()
+        };
+        let seven_d = UsageSection {
+            limit_window_seconds: Some(604_800),
+            ..Default::default()
+        };
+        assert_eq!(window_label(&five_h, strings), "5h");
+        assert_eq!(window_label(&seven_d, strings), "7d");
+    }
+
+    #[test]
+    fn maps_single_primary_window_only() {
+        let response = CodexUsageResponse {
+            rate_limit: Some(CodexRateLimit {
+                primary_window: Some(CodexUsageBucket {
+                    used_percent: 97.0,
+                    reset_at: Some(1_785_258_146),
+                    limit_window_seconds: Some(604_800),
+                    reset_after_seconds: Some(398_475),
+                }),
+                secondary_window: None,
+            }),
+        };
+        let data = codex_usage_response_to_data(response).expect("single window");
+        assert_eq!(data.windows.len(), 1);
+        assert_eq!(data.windows[0].percentage, 97.0);
+        assert_eq!(data.windows[0].limit_window_seconds, Some(604_800));
+    }
+
+    #[test]
+    fn maps_two_windows_when_both_present() {
+        let response = CodexUsageResponse {
+            rate_limit: Some(CodexRateLimit {
+                primary_window: Some(CodexUsageBucket {
+                    used_percent: 10.0,
+                    reset_at: Some(1_700_000_000),
+                    limit_window_seconds: Some(18_000),
+                    reset_after_seconds: None,
+                }),
+                secondary_window: Some(CodexUsageBucket {
+                    used_percent: 40.0,
+                    reset_at: Some(1_700_100_000),
+                    limit_window_seconds: Some(604_800),
+                    reset_after_seconds: None,
+                }),
+            }),
+        };
+        let data = codex_usage_response_to_data(response).expect("two windows");
+        assert_eq!(data.windows.len(), 2);
+        assert_eq!(data.windows[0].limit_window_seconds, Some(18_000));
+        assert_eq!(data.windows[1].limit_window_seconds, Some(604_800));
     }
 }

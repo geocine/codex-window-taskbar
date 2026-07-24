@@ -4,7 +4,7 @@ Native Windows taskbar widget for Codex usage.
 
 ## Features
 
-- `5h` and `7d` remaining usage rows
+- Remaining usage rows from Codex (`5h` and/or `7d`; single window is centered)
 - 10 blue segments per row
 - Reset countdowns
 - Tray icon tooltip

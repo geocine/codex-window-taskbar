@@ -23,7 +23,8 @@ use crate::diagnose;
 use crate::localization::{self, Strings};
 use crate::models::UsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_TASKBAR_RETRY, WM_APP_TRAY,
+    WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::theme;
@@ -44,6 +45,14 @@ impl SendHwnd {
     }
 }
 
+/// One painted usage row (label + bar + remaining text).
+#[derive(Clone, Debug)]
+struct DisplayRow {
+    label: String,
+    percent: f64,
+    text: String,
+}
+
 /// Shared application state
 struct AppState {
     hwnd: SendHwnd,
@@ -57,10 +66,8 @@ struct AppState {
     is_dark: bool,
     embedded: bool,
 
-    codex_session_percent: f64,
-    codex_session_text: String,
-    codex_weekly_percent: f64,
-    codex_weekly_text: String,
+    /// 1 or 2 rows depending on what the usage API returns.
+    display_rows: Vec<DisplayRow>,
 
     codex_data: Option<UsageData>,
 
@@ -74,6 +81,21 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+}
+
+fn default_display_rows(strings: Strings) -> Vec<DisplayRow> {
+    vec![
+        DisplayRow {
+            label: strings.session_window.to_string(),
+            percent: 0.0,
+            text: "--".to_string(),
+        },
+        DisplayRow {
+            label: strings.weekly_window.to_string(),
+            percent: 0.0,
+            text: "--".to_string(),
+        },
+    ]
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -338,16 +360,21 @@ fn save_state_settings() {
 fn tray_icon_data_from_state() -> (Option<f64>, String) {
     let state = lock_state();
     match state.as_ref() {
-        Some(s) if s.last_poll_ok => {
-            let tooltip = format!(
-                "Codex 5h: {} | 7d: {}",
-                s.codex_session_text, s.codex_weekly_text
-            );
+        Some(s) if s.last_poll_ok && !s.display_rows.is_empty() => {
+            let tooltip = s
+                .display_rows
+                .iter()
+                .map(|row| format!("{}: {}", row.label, row.text))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let max_used = s
+                .display_rows
+                .iter()
+                .map(|row| row.percent)
+                .fold(0.0_f64, f64::max);
             (
-                Some(poller::remaining_percent(
-                    s.codex_session_percent.max(s.codex_weekly_percent),
-                )),
-                tooltip,
+                Some(poller::remaining_percent(max_used)),
+                format!("Codex {tooltip}"),
             )
         }
         _ => (None, "Codex Windows Taskbar".to_string()),
@@ -367,6 +394,7 @@ fn toggle_widget_visibility(hwnd: HWND) {
     save_state_settings();
     unsafe {
         if new_visible {
+            ensure_taskbar_attachment();
             position_at_taskbar();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             render_layered();
@@ -382,14 +410,16 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     let strings = localization::strings();
-    if let Some((session_text, weekly_text)) = state.codex_data.as_ref().map(|data| {
-        (
-            poller::format_line(&data.session, strings),
-            poller::format_line(&data.weekly, strings),
-        )
-    }) {
-        state.codex_session_text = session_text;
-        state.codex_weekly_text = weekly_text;
+    if let Some(data) = state.codex_data.as_ref() {
+        state.display_rows = data
+            .windows
+            .iter()
+            .map(|window| DisplayRow {
+                label: poller::window_label(window, strings),
+                percent: window.percentage,
+                text: poller::format_line(window, strings),
+            })
+            .collect();
     }
 }
 
@@ -548,28 +578,31 @@ fn usage_bar_x() -> i32 {
     usage_label_x() + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN)
 }
 
-fn bar_rect(row: UsageRow) -> RECT {
+/// Vertical Y origins for each usage row inside the widget.
+/// One row is centered; two rows keep the existing dual-row layout.
+fn row_ys(height: i32, row_count: usize) -> Vec<i32> {
+    let seg_h = sc(SEGMENT_H);
+    match row_count {
+        0 => Vec::new(),
+        1 => vec![(height - seg_h) / 2],
+        _ => {
+            let row2_y = height - sc(7) - seg_h;
+            let row1_y = row2_y - sc(6) - seg_h;
+            vec![row1_y, row2_y]
+        }
+    }
+}
+
+fn bar_rect_for_row(row_index: usize, row_count: usize) -> Option<RECT> {
     let height = sc(WIDGET_HEIGHT);
     let bar_x = usage_bar_x();
-    let row2_y = height - sc(7) - sc(SEGMENT_H);
-    let row1_y = row2_y - sc(6) - sc(SEGMENT_H);
-    let top = match row {
-        UsageRow::Session => row1_y,
-        UsageRow::Weekly => row2_y,
-    };
-
-    RECT {
+    let top = *row_ys(height, row_count).get(row_index)?;
+    Some(RECT {
         left: bar_x,
         top,
         right: bar_x + provider_bar_width(),
         bottom: top + sc(SEGMENT_H),
-    }
-}
-
-#[derive(Clone, Copy)]
-enum UsageRow {
-    Session,
-    Weekly,
+    })
 }
 
 fn reset_tooltip_text(label: &str, resets_at: Option<SystemTime>) -> String {
@@ -632,34 +665,55 @@ fn format_human_local_reset_time(time: SystemTime) -> Option<String> {
 
 fn usage_tooltip_text(state: &AppState) -> String {
     let strings = localization::strings();
-    let (session_reset, weekly_reset) = if state.last_poll_ok {
-        state
-            .codex_data
-            .as_ref()
-            .map(|data| (data.session.resets_at, data.weekly.resets_at))
-            .unwrap_or((None, None))
-    } else {
-        (None, None)
-    };
+    if state.last_poll_ok {
+        if let Some(data) = state.codex_data.as_ref() {
+            if !data.windows.is_empty() {
+                return data
+                    .windows
+                    .iter()
+                    .map(|window| {
+                        reset_tooltip_text(
+                            &poller::window_label(window, strings),
+                            window.resets_at,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+        }
+    }
 
-    format!(
-        "{}\n{}",
-        reset_tooltip_text(strings.session_window, session_reset),
-        reset_tooltip_text(strings.weekly_window, weekly_reset)
-    )
+    // Loading / error fallback matches current placeholder rows.
+    state
+        .display_rows
+        .iter()
+        .map(|row| reset_tooltip_text(&row.label, None))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn point_is_over_usage_bar(x: i32, y: i32) -> bool {
-    let mut session = bar_rect(UsageRow::Session);
-    let mut weekly = bar_rect(UsageRow::Weekly);
-    for rect in [&mut session, &mut weekly] {
+    let row_count = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| s.display_rows.len().max(1))
+            .unwrap_or(1)
+    };
+    let pt = POINT { x, y };
+    for index in 0..row_count {
+        let Some(mut rect) = bar_rect_for_row(index, row_count) else {
+            continue;
+        };
         rect.left -= sc(3);
         rect.top -= sc(4);
         rect.right += sc(3);
         rect.bottom += sc(4);
+        if point_in_rect(pt, rect) {
+            return true;
+        }
     }
-    let pt = POINT { x, y };
-    point_in_rect(pt, session) || point_in_rect(pt, weekly)
+    false
 }
 
 fn track_mouse_leave(hwnd: HWND) {
@@ -698,7 +752,9 @@ fn show_usage_tooltip(hwnd: HWND) {
         let _ = SetWindowTextW(tooltip, PCWSTR::from_raw(text.as_ptr()));
         let x = widget_rect.left + usage_label_x() - sc(TOOLTIP_TEXT_PADDING_X);
         let width = tooltip_width_for_text(tooltip, &tooltip_text);
-        let height = sc(TOOLTIP_HEIGHT);
+        let line_count = tooltip_text.lines().count().max(1) as i32;
+        // One line for a single window, two lines when both 5h + 7d are present.
+        let height = sc(18 + line_count * 14).max(sc(TOOLTIP_HEIGHT / 2));
         let mut y = widget_rect.top - height - sc(6);
         if y < 0 {
             y = widget_rect.bottom + sc(6);
@@ -1036,6 +1092,7 @@ pub fn run() {
 
         let is_dark = theme::is_dark_mode();
         let mut embedded = false;
+        let strings = localization::strings();
 
         {
             let mut state = lock_state();
@@ -1050,10 +1107,7 @@ pub fn run() {
                 win_event_hook: None,
                 is_dark,
                 embedded: false,
-                codex_session_percent: 0.0,
-                codex_session_text: "--".to_string(),
-                codex_weekly_percent: 0.0,
-                codex_weekly_text: "--".to_string(),
+                display_rows: default_display_rows(strings),
                 codex_data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
@@ -1069,34 +1123,8 @@ pub fn run() {
         install_usage_tooltip(hwnd, HINSTANCE(hinstance.0));
 
         // Try to embed in taskbar
-        if let Some(taskbar_hwnd) = native_interop::find_taskbar() {
-            diagnose::log(format!("taskbar found hwnd={:?}", taskbar_hwnd));
-            native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
+        if attach_to_taskbar(hwnd) {
             embedded = true;
-
-            let mut state = lock_state();
-            let s = state.as_mut().unwrap();
-            s.taskbar_hwnd = Some(taskbar_hwnd);
-            s.embedded = true;
-
-            let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
-            s.tray_notify_hwnd = tray_notify;
-            if tray_notify.is_some() {
-                diagnose::log("TrayNotifyWnd found");
-            } else {
-                diagnose::log("TrayNotifyWnd not found");
-            }
-
-            if let Some(tray_hwnd) = tray_notify {
-                let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-                let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
-                s.win_event_hook = hook;
-                if hook.is_some() {
-                    diagnose::log("tray event hook installed");
-                } else {
-                    diagnose::log("tray event hook could not be installed");
-                }
-            }
         } else {
             diagnose::log("taskbar not found; using fallback popup window");
         }
@@ -1113,6 +1141,8 @@ pub fn run() {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+            // Explorer may not be ready at login; retry attachment shortly.
+            SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
         }
 
         // Register system tray icon
@@ -1164,28 +1194,10 @@ pub fn run() {
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
 fn render_layered() {
     refresh_dpi();
-    let (
-        hwnd_val,
-        is_dark,
-        embedded,
-        strings,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-    ) = {
+    let (hwnd_val, is_dark, embedded, display_rows) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                localization::strings(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-            ),
+            Some(s) => (s.hwnd, s.is_dark, s.embedded, s.display_rows.clone()),
             None => return,
         }
     };
@@ -1262,11 +1274,7 @@ fn render_layered() {
             &text_color,
             &codex_accent,
             &track,
-            strings,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
+            &display_rows,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1325,11 +1333,7 @@ fn paint_content(
     text_color: &Color,
     codex_accent: &Color,
     track: &Color,
-    strings: Strings,
-    codex_session_pct: f64,
-    codex_session_text: &str,
-    codex_weekly_pct: f64,
-    codex_weekly_text: &str,
+    rows: &[DisplayRow],
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1381,8 +1385,7 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = usage_label_x();
-        let row2_y = height - sc(7) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(6) - sc(SEGMENT_H);
+        let ys = row_ys(height, rows.len().max(1));
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -1406,26 +1409,18 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        draw_row(
-            hdc,
-            content_x,
-            row1_y,
-            strings.session_window,
-            codex_session_pct,
-            codex_session_text,
-            codex_accent,
-            track,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            strings.weekly_window,
-            codex_weekly_pct,
-            codex_weekly_text,
-            codex_accent,
-            track,
-        );
+        for (row, y) in rows.iter().zip(ys.iter()) {
+            draw_row(
+                hdc,
+                content_x,
+                *y,
+                &row.label,
+                row.percent,
+                &row.text,
+                codex_accent,
+                track,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -1436,8 +1431,12 @@ fn request_refresh(hwnd: HWND) {
     {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            s.codex_session_text = "...".to_string();
-            s.codex_weekly_text = "...".to_string();
+            if s.display_rows.is_empty() {
+                s.display_rows = default_display_rows(localization::strings());
+            }
+            for row in &mut s.display_rows {
+                row.text = "...".to_string();
+            }
         }
     }
     render_layered();
@@ -1456,8 +1455,6 @@ fn do_poll(send_hwnd: SendHwnd) {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 let any_past_reset = poller::is_past_reset(&data);
-                s.codex_session_percent = data.session.percentage;
-                s.codex_weekly_percent = data.weekly.percentage;
                 s.codex_data = Some(data);
 
                 if !any_past_reset {
@@ -1487,8 +1484,12 @@ fn do_poll(send_hwnd: SendHwnd) {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             s.last_poll_ok = false;
-            s.codex_session_text = "...".to_string();
-            s.codex_weekly_text = "...".to_string();
+            if s.display_rows.is_empty() {
+                s.display_rows = default_display_rows(localization::strings());
+            }
+            for row in &mut s.display_rows {
+                row.text = "...".to_string();
+            }
             s.retry_count = s.retry_count.saturating_add(1);
             let backoff = RETRY_BASE_MS
                 .saturating_mul(1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX));
@@ -1533,14 +1534,10 @@ fn schedule_countdown_timer() {
 
     let mut min_delay: Option<Duration> = None;
     for data in [&s.codex_data].into_iter().flatten() {
-        for delay in [
-            poller::time_until_display_change(data.session.resets_at),
-            poller::time_until_display_change(data.weekly.resets_at),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            min_delay = Some(min_delay.map_or(delay, |current| current.min(delay)));
+        for window in &data.windows {
+            if let Some(delay) = poller::time_until_display_change(window.resets_at) {
+                min_delay = Some(min_delay.map_or(delay, |current| current.min(delay)));
+            }
         }
     }
 
@@ -1612,11 +1609,170 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
+/// Find the taskbar, reparent the widget into it, and install the tray hook.
+/// Returns true when embedding succeeds.
+fn attach_to_taskbar(hwnd: HWND) -> bool {
+    let Some(taskbar_hwnd) = native_interop::find_taskbar() else {
+        return false;
+    };
+    if !native_interop::is_window(taskbar_hwnd) {
+        return false;
+    }
+
+    diagnose::log(format!("taskbar found hwnd={:?}", taskbar_hwnd));
+    native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
+
+    let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
+    if tray_notify.is_some() {
+        diagnose::log("TrayNotifyWnd found");
+    } else {
+        diagnose::log("TrayNotifyWnd not found");
+    }
+
+    let old_hook = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return false;
+        };
+        let old_hook = s.win_event_hook.take();
+        s.taskbar_hwnd = Some(taskbar_hwnd);
+        s.tray_notify_hwnd = tray_notify;
+        s.embedded = true;
+        old_hook
+    };
+
+    if let Some(hook) = old_hook {
+        native_interop::unhook_win_event(hook);
+    }
+
+    if let Some(tray_hwnd) = tray_notify {
+        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+        let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.win_event_hook = hook;
+        }
+        if hook.is_some() {
+            diagnose::log("tray event hook installed");
+        } else {
+            diagnose::log("tray event hook could not be installed");
+        }
+    }
+
+    true
+}
+
+/// Recover from explorer restarts / lost parents so the widget stays on the taskbar.
+fn ensure_taskbar_attachment() {
+    let (hwnd, taskbar_hwnd, tray_notify_hwnd, embedded, widget_visible) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        (
+            s.hwnd.to_hwnd(),
+            s.taskbar_hwnd,
+            s.tray_notify_hwnd,
+            s.embedded,
+            s.widget_visible,
+        )
+    };
+
+    let taskbar_alive = taskbar_hwnd
+        .map(native_interop::is_window)
+        .unwrap_or(false);
+
+    if !taskbar_alive {
+        diagnose::log("taskbar handle invalid; attempting re-attach");
+        if attach_to_taskbar(hwnd) {
+            if widget_visible {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+            }
+        } else {
+            // Keep retrying until explorer is back.
+            unsafe {
+                SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
+            }
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.taskbar_hwnd = None;
+                s.tray_notify_hwnd = None;
+                s.embedded = false;
+            }
+        }
+        return;
+    }
+
+    let taskbar_hwnd = taskbar_hwnd.expect("checked alive");
+
+    // Child can become orphaned (parent desktop / null) after explorer restarts.
+    if embedded {
+        let parent = native_interop::get_parent(hwnd);
+        if parent != taskbar_hwnd {
+            diagnose::log("widget parent lost; re-embedding into taskbar");
+            native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.embedded = true;
+            }
+            if widget_visible {
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+        }
+    } else if attach_to_taskbar(hwnd) {
+        if widget_visible {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+        }
+        return;
+    }
+
+    let tray_alive = tray_notify_hwnd
+        .map(native_interop::is_window)
+        .unwrap_or(false);
+    if !tray_alive {
+        let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
+        let old_hook = {
+            let mut state = lock_state();
+            let Some(s) = state.as_mut() else {
+                return;
+            };
+            let old_hook = s.win_event_hook.take();
+            s.tray_notify_hwnd = tray_notify;
+            old_hook
+        };
+        if let Some(hook) = old_hook {
+            native_interop::unhook_win_event(hook);
+        }
+        if let Some(tray_hwnd) = tray_notify {
+            let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+            let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.win_event_hook = hook;
+            }
+        }
+    }
+}
+
 fn position_at_taskbar() {
     refresh_dpi();
+    ensure_taskbar_attachment();
+
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
+    let (hwnd, embedded, tray_offset, taskbar_hwnd, widget_visible) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -1629,24 +1785,31 @@ fn position_at_taskbar() {
         }
 
         let taskbar_hwnd = match s.taskbar_hwnd {
-            Some(h) => h,
-            None => {
+            Some(h) if native_interop::is_window(h) => h,
+            _ => {
                 diagnose::log("position_at_taskbar skipped: no taskbar handle");
                 return;
             }
         };
 
-        (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
+        (
+            s.hwnd.to_hwnd(),
+            s.embedded,
+            s.tray_offset,
+            taskbar_hwnd,
+            s.widget_visible,
+        )
     };
 
     let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
-        Some(r) => r,
-        None => {
+        Some(r) if r.right > r.left && r.bottom > r.top => r,
+        _ => {
             diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
             return;
         }
     };
 
+    let taskbar_width = taskbar_rect.right - taskbar_rect.left;
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
     let mut tray_left = taskbar_rect.right;
     let anchor_top = taskbar_rect.top;
@@ -1654,29 +1817,49 @@ fn position_at_taskbar() {
 
     if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
         if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
+            // Ignore stale/zero tray rects that can push the widget off-screen.
+            if tray_rect.left >= taskbar_rect.left && tray_rect.left <= taskbar_rect.right {
+                tray_left = tray_rect.left;
+            }
         }
     }
 
     let widget_width = total_widget_width();
-
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset + sc(TRAY_EDGE_OVERLAP);
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
+        let mut x =
+            tray_left - taskbar_rect.left - widget_width - tray_offset + sc(TRAY_EDGE_OVERLAP);
+        let max_x = (taskbar_width - widget_width).max(0);
+        x = x.clamp(0, max_x);
+        let mut rel_y = y - taskbar_rect.top;
+        let max_y = (taskbar_height - widget_height).max(0);
+        rel_y = rel_y.clamp(0, max_y);
+        native_interop::move_window(hwnd, x, rel_y, widget_width, widget_height);
         diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
+            "positioned embedded widget at x={x} y={rel_y} w={widget_width} h={widget_height}"
         ));
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset + sc(TRAY_EDGE_OVERLAP);
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+        let mut x = tray_left - widget_width - tray_offset + sc(TRAY_EDGE_OVERLAP);
+        let min_x = taskbar_rect.left;
+        let max_x = (taskbar_rect.right - widget_width).max(min_x);
+        x = x.clamp(min_x, max_x);
+        let mut screen_y = y;
+        let max_y = (taskbar_rect.bottom - widget_height).max(taskbar_rect.top);
+        screen_y = screen_y.clamp(taskbar_rect.top, max_y);
+        native_interop::move_window(hwnd, x, screen_y, widget_width, widget_height);
         diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
+            "positioned fallback widget at x={x} y={screen_y} w={widget_width} h={widget_height}"
         ));
+    }
+
+    if widget_visible {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
     }
 }
 
@@ -1725,6 +1908,7 @@ unsafe extern "system" fn on_tray_location_changed(
             }
         };
         if should_reposition {
+            ensure_taskbar_attachment();
             position_at_taskbar();
             render_layered();
         }
@@ -1769,6 +1953,7 @@ unsafe extern "system" fn wnd_proc(
             }
             refresh_dpi();
             update_usage_tooltip();
+            ensure_taskbar_attachment();
             position_at_taskbar();
             render_layered();
             LRESULT(0)
@@ -1797,6 +1982,18 @@ unsafe extern "system" fn wnd_proc(
                         std::thread::spawn(move || {
                             do_poll(sh);
                         });
+                    }
+                }
+                TIMER_TASKBAR_RETRY => {
+                    ensure_taskbar_attachment();
+                    position_at_taskbar();
+                    render_layered();
+                    let embedded = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.embedded).unwrap_or(false)
+                    };
+                    if embedded {
+                        let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
                     }
                 }
                 _ => {}
@@ -2201,24 +2398,10 @@ fn show_context_menu(hwnd: HWND) {
 
 /// Paint for non-embedded fallback (normal WM_PAINT path)
 fn paint(hdc: HDC, hwnd: HWND) {
-    let (
-        is_dark,
-        strings,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-    ) = {
+    let (is_dark, display_rows) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.is_dark,
-                localization::strings(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-            ),
+            Some(s) => (s.is_dark, s.display_rows.clone()),
             None => return,
         }
     };
@@ -2263,11 +2446,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &text_color,
             &codex_accent,
             &track,
-            strings,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
+            &display_rows,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);

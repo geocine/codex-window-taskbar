@@ -17,6 +17,7 @@ pub const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
+pub const TIMER_TASKBAR_RETRY: usize = 4;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -50,7 +51,7 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
     }
 }
 
-/// Get taskbar position via SHAppBarMessage
+/// Get taskbar position via SHAppBarMessage, falling back to GetWindowRect.
 pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
     unsafe {
         let mut abd = APPBARDATA {
@@ -59,10 +60,14 @@ pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
             ..Default::default()
         };
         let result = SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd);
-        if result == 0 {
-            return None;
+        if result != 0 {
+            let rc = abd.rc;
+            if rc.right > rc.left && rc.bottom > rc.top {
+                return Some(rc);
+            }
         }
-        Some(abd.rc)
+        // AppBar query can fail during explorer restarts or layout races.
+        get_window_rect_safe(taskbar_hwnd)
     }
 }
 
@@ -76,6 +81,16 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
             None
         }
     }
+}
+
+/// Returns true if the HWND still refers to a live window.
+pub fn is_window(hwnd: HWND) -> bool {
+    unsafe { IsWindow(hwnd).as_bool() }
+}
+
+/// Parent of a child window, or default if none / not a child.
+pub fn get_parent(hwnd: HWND) -> HWND {
+    unsafe { GetParent(hwnd).unwrap_or_default() }
 }
 
 /// Embed our window as a child of the taskbar
@@ -95,6 +110,18 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
         let _ = SetParent(hwnd, taskbar_hwnd);
+
+        // Apply style/parent changes; without FRAMECHANGED, reparenting can
+        // intermittently leave the window stranded at screen origin.
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+        );
     }
 }
 
