@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 239 46" width="1195" height="230" role="img" aria-label="Codex taskbar widget: 7d window, 52% remaining, resets in 2d">
+  <!-- Faithful rendering of src/window.rs paint_content() in dark mode at 100% DPI:
+       widget 239x46 on the taskbar background, left divider, "7d" label,
+       10 segments (10x13, 1px gap, r=2) at 52% remaining, "52% 2d" text. -->
+  <rect width="239" height="46" fill="#1C1C1C"/>
+
+  <!-- Left divider: 2px light column + 1px dark column, 25px tall, centered -->
+  <rect x="0" y="10" width="2" height="25" fill="#505050"/>
+  <rect x="2" y="10" width="1" height="25" fill="#282828"/>
+
+  <!-- Window label -->
+  <text x="13" y="22.5" font-family="Consolas, 'Cascadia Mono', 'DejaVu Sans Mono', monospace" font-size="12" fill="#888888" dominant-baseline="central">7d</text>
+
+  <!-- Segment bar: 52% remaining = 5 full segments + 20% of the sixth -->
+  <g>
+    <rect x="41" y="16" width="10" height="13" rx="2" fill="#3BAFDA"/>
+    <rect x="52" y="16" width="10" height="13" rx="2" fill="#3BAFDA"/>
+    <rect x="63" y="16" width="10" height="13" rx="2" fill="#3BAFDA"/>
+    <rect x="74" y="16" width="10" height="13" rx="2" fill="#3BAFDA"/>
+    <rect x="85" y="16" width="10" height="13" rx="2" fill="#3BAFDA"/>
+    <clipPath id="seg-partial"><rect x="96" y="16" width="10" height="13" rx="2"/></clipPath>
+    <rect x="96" y="16" width="10" height="13" rx="2" fill="#444444"/>
+    <rect x="96" y="16" width="2" height="13" fill="#3BAFDA" clip-path="url(#seg-partial)"/>
+    <rect x="107" y="16" width="10" height="13" rx="2" fill="#444444"/>
+    <rect x="118" y="16" width="10" height="13" rx="2" fill="#444444"/>
+    <rect x="129" y="16" width="10" height="13" rx="2" fill="#444444"/>
+    <rect x="140" y="16" width="10" height="13" rx="2" fill="#444444"/>
+  </g>
+
+  <!-- Percent + reset countdown ("{:>3}%" right-aligns the number, hence the offset) -->
+  <text x="159.6" y="22.5" font-family="Consolas, 'Cascadia Mono', 'DejaVu Sans Mono', monospace" font-size="12" fill="#888888" dominant-baseline="central">52% 2d</text>
+</svg>

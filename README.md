@@ -2,6 +2,8 @@
 
 Native Windows taskbar widget for Codex usage.
 
+![Codex taskbar widget showing the 7d window at 52% remaining, resetting in 2 days](docs/taskbar-widget.svg)
+
 ## Features
 
 - Remaining usage rows from Codex (`5h` and/or `7d`; single window is centered)
