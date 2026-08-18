@@ -4,6 +4,12 @@ Native Windows taskbar widget for Codex usage.
 
 ![Codex taskbar widget showing the 7d window at 52% remaining, resetting in 2 days](docs/taskbar-widget.svg)
 
+## Download
+
+**[Download codex-windows-taskbar.exe](https://github.com/geocine/codex-window-taskbar/releases/latest/download/codex-windows-taskbar.exe)** ([all releases](https://github.com/geocine/codex-window-taskbar/releases))
+
+No installer — run the exe and the widget appears on your taskbar.
+
 ## Features
 
 - Remaining usage rows from Codex (`5h` and/or `7d`; single window is centered)
